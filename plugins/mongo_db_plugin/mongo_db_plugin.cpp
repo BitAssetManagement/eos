@@ -55,6 +55,8 @@ public:
    fc::optional<boost::signals2::scoped_connection> accepted_transaction_connection;
    fc::optional<boost::signals2::scoped_connection> applied_transaction_connection;
 
+   void consume_blocks();
+
    void accepted_block( const chain::block_state_ptr& );
    void applied_irreversible_block(const chain::block_state_ptr&);
    void accepted_transaction(const chain::transaction_metadata_ptr&);
@@ -90,16 +92,12 @@ public:
    std::deque<chain::block_state_ptr> block_state_process_queue;
    std::deque<chain::block_state_ptr> irreversible_block_state_queue;
    std::deque<chain::block_state_ptr> irreversible_block_state_process_queue;
-   // transaction.id -> actions
-   std::map<std::string, std::vector<chain::action>> reversible_actions;
    boost::mutex mtx;
    boost::condition_variable condition;
    boost::thread consume_thread;
    boost::atomic<bool> done{false};
    boost::atomic<bool> startup{true};
    fc::optional<chain::chain_id_type> chain_id;
-
-   void consume_blocks();
 
    static const account_name newaccount;
    static const account_name setabi;
@@ -360,6 +358,26 @@ fc::variant to_variant_with_abi( const T& obj, mongocxx::collection& accounts ) 
    return pretty_output;
 }
 
+void handle_mongo_exception( const char* desc, int line_num ) {
+   try {
+      try {
+         throw;
+      } catch( fc::exception& er ) {
+         elog( "mongo fc exception, ${desc}, line $(line_nun), ${details}",
+               ("desc", desc)( "line_num", line_num )( "details", er.to_detail_string()));
+      } catch( const std::exception& e ) {
+         elog( "mongo std exception, ${desc}, line $(line_nun), ${what}",
+               ("desc", desc)( "line_num", line_num )( "what", e.what()));
+      } catch( ... ) {
+         elog( "mongo unknown exception, ${desc}, line $(line_nun)", ("desc", desc)( "line_num", line_num ));
+      }
+   } catch (...) {
+      std::cerr << "Exception attempting to handle exception for " << desc << " " << line_num << std::endl;
+   }
+
+   // shutdown if mongo failed to provide opportunity to fix issue and restart
+   app().quit();
+}
 
 void update_account( mongocxx::collection& accounts, const chain::action& act ) {
    using bsoncxx::builder::basic::kvp;
@@ -376,9 +394,13 @@ void update_account( mongocxx::collection& accounts, const chain::action& act ) 
          auto newaccount = act.data_as<chain::newaccount>();
 
          // create new account
-         if( !accounts.insert_one( make_document( kvp( "name", newaccount.name.to_string()),
-                                                  kvp( "createdAt", b_date{now} )))) {
-            elog( "Failed to insert account ${n}", ("n", newaccount.name));
+         try {
+            if( !accounts.insert_one( make_document( kvp( "name", newaccount.name.to_string()),
+                                                     kvp( "createdAt", b_date{now} )))) {
+               FC_ASSERT( false, "Failed to insert account ${n}", ("n", newaccount.name) );
+            }
+         } catch(...) {
+            handle_mongo_exception("account insert", __LINE__);
          }
 
       } else if( act.name == mongo_db_plugin_impl::setabi ) {
@@ -402,9 +424,13 @@ void update_account( mongocxx::collection& accounts, const chain::action& act ) 
                      kvp( "$set", make_document( kvp( "abi", bsoncxx::from_json( json_str )),
                                                  kvp( "updatedAt", b_date{now} ))));
 
-               if( !accounts.update_one( make_document( kvp( "_id", from_account->view()["_id"].get_oid())),
-                                         update_from.view())) {
-                  elog( "Failed to udpdate account ${n}", ("n", setabi.account));
+               try {
+                  if( !accounts.update_one( make_document( kvp( "_id", from_account->view()["_id"].get_oid())),
+                                            update_from.view())) {
+                     FC_ASSERT( false, "Failed to udpdate account ${n}", ("n", setabi.account));
+                  }
+               } catch(...) {
+                  handle_mongo_exception("account update", __LINE__);
                }
             } catch( fc::exception& e ) {
                // if unable to unpack abi_def then just don't save the abi
@@ -466,7 +492,7 @@ void add_data( bsoncxx::builder::basic::document& act_doc, mongocxx::collection&
       }
    } catch( fc::exception& e ) {
       if( act.name != "onblock" ) { // onblock not in original eosio.system contract abi
-         dlog( "Unable to convert action.data to ABI: ${s}::${n}, what: ${e}",
+         ilog( "Unable to convert action.data to ABI: ${s}::${n}, what: ${e}",
                ("s", act.account)( "n", act.name )( "e", e.to_detail_string()));
       }
    } catch( std::exception& e ) {
@@ -682,21 +708,21 @@ void mongo_db_plugin_impl::_process_accepted_transaction( const chain::transacti
 
       trans_doc.append( kvp( "createdAt", b_date{now} ));
 
-      if( !trans.insert_one( trans_doc.view())) {
-         elog( "Failed to insert trans ${id}", ("id", trx_id));
-      }
-
-      if( actions_to_write ) {
-         auto result = bulk_actions.execute();
-         if( !result ) {
-            elog( "Bulk actions insert failed for transaction: ${id}", ("id", trx_id_str));
+      try {
+         if( !trans.insert_one( trans_doc.view())) {
+            FC_ASSERT( false, "Failed to insert trans ${id}", ("id", trx_id));
          }
+      } catch(...) {
+         handle_mongo_exception("trans insert", __LINE__);
       }
 
       if (actions_to_write) {
-         auto result = bulk_actions.execute();
-         if (!result) {
-            elog("Bulk actions insert failed for transaction: ${id}", ("id", trx_id_str));
+         try {
+            if( !bulk_actions.execute() ) {
+               FC_ASSERT( false, "Bulk actions insert failed for transaction: ${id}", ("id", trx_id_str));
+            }
+         } catch(...) {
+            handle_mongo_exception("actions insert", __LINE__);
          }
       }
    }
@@ -723,8 +749,12 @@ void mongo_db_plugin_impl::_process_applied_transaction( const chain::transactio
       elog( "  JSON: ${j}", ("j", json));
    }
 
-   if( !trans_traces.insert_one( trans_traces_doc.view())) {
-      elog( "Failed to insert trans ${id}", ("id", t->id));
+   try {
+      if( !trans_traces.insert_one( trans_traces_doc.view())) {
+         FC_ASSERT( false, "Failed to insert trans ${id}", ("id", t->id));
+      }
+   } catch(...) {
+      handle_mongo_exception("trans_traces insert", __LINE__);
    }
 }
 
@@ -759,8 +789,12 @@ void mongo_db_plugin_impl::_process_accepted_block( const chain::block_state_ptr
       elog("  JSON: ${j}", ("j", json));
    }
 
-   if (!block_states.insert_one(block_state_doc.view())) {
-      elog("Failed to insert block_state ${bid}", ("bid", block_id));
+   try {
+      if( !block_states.insert_one( block_state_doc.view())) {
+         FC_ASSERT( false, "Failed to insert block_state ${bid}", ("bid", block_id));
+      }
+   } catch(...) {
+      handle_mongo_exception("block_states insert", __LINE__);
    }
 
    auto blocks = mongo_conn[db_name][blocks_col];
@@ -779,8 +813,12 @@ void mongo_db_plugin_impl::_process_accepted_block( const chain::block_state_ptr
       elog("  JSON: ${j}", ("j", json));
    }
 
-   if (!blocks.insert_one(block_doc.view())) {
-      elog("Failed to insert block ${bid}", ("bid", block_id));
+   try {
+      if( !blocks.insert_one( block_doc.view())) {
+         FC_ASSERT( false, "Failed to insert block ${bid}", ("bid", block_id));
+      }
+   } catch(...) {
+      handle_mongo_exception("blocks insert", __LINE__);
    }
 }
 
@@ -851,10 +889,13 @@ void mongo_db_plugin_impl::_process_irreversible_block(const chain::block_state_
       }
    }
 
-   if (transactions_in_block) {
-      auto result = bulk.execute();
-      if (!result) {
-         elog("Bulk transaction insert failed for block: ${bid}", ("bid", block_id));
+   if( transactions_in_block ) {
+      try {
+         if( !bulk.execute()) {
+            FC_ASSERT( false, "Bulk transaction insert failed for block: ${bid}", ("bid", block_id));
+         }
+      } catch(...) {
+         handle_mongo_exception("bulk transaction insert", __LINE__);
       }
    }
 }
@@ -916,24 +957,33 @@ void mongo_db_plugin_impl::init() {
                                 kvp( "abi", bsoncxx::from_json( json_str )),
                                 kvp( "createdAt", b_date{now} ));
 
-      if (!accounts.insert_one(doc.view())) {
-         elog("Failed to insert account ${n}", ("n", name(chain::config::system_account_name).to_string()));
+      try {
+         if( !accounts.insert_one( doc.view())) {
+            FC_ASSERT( false, "Failed to insert account ${n}",
+                       ("n", name( chain::config::system_account_name ).to_string()));
+         }
+      } catch(...) {
+         handle_mongo_exception("account insert", __LINE__);
       }
 
-      // blocks indexes
-      auto blocks = mongo_conn[db_name][blocks_col]; // Blocks
-      blocks.create_index(bsoncxx::from_json(R"xxx({ "block_num" : 1 })xxx"));
-      blocks.create_index(bsoncxx::from_json(R"xxx({ "block_id" : 1 })xxx"));
+      try {
+         // blocks indexes
+         auto blocks = mongo_conn[db_name][blocks_col]; // Blocks
+         blocks.create_index( bsoncxx::from_json( R"xxx({ "block_num" : 1 })xxx" ));
+         blocks.create_index( bsoncxx::from_json( R"xxx({ "block_id" : 1 })xxx" ));
 
-      // accounts indexes
-      accounts.create_index(bsoncxx::from_json(R"xxx({ "name" : 1 })xxx"));
+         // accounts indexes
+         accounts.create_index( bsoncxx::from_json( R"xxx({ "name" : 1 })xxx" ));
 
-      // transactions indexes
-      auto trans = mongo_conn[db_name][trans_col]; // Transactions
-      trans.create_index(bsoncxx::from_json(R"xxx({ "trx_id" : 1 })xxx"));
+         // transactions indexes
+         auto trans = mongo_conn[db_name][trans_col]; // Transactions
+         trans.create_index( bsoncxx::from_json( R"xxx({ "trx_id" : 1 })xxx" ));
 
-      auto actions = mongo_conn[db_name][actions_col];
-      actions.create_index(bsoncxx::from_json(R"xxx({ "trx_id" : 1 })xxx"));
+         auto actions = mongo_conn[db_name][actions_col];
+         actions.create_index( bsoncxx::from_json( R"xxx({ "trx_id" : 1 })xxx" ));
+      } catch(...) {
+         handle_mongo_exception("create indexes", __LINE__);
+      }
    }
 }
 
@@ -959,7 +1009,7 @@ void mongo_db_plugin::set_program_options(options_description& cli, options_desc
          "Required with --replay-blockchain, --hard-replay-blockchain, or --delete-all-blocks to wipe mongo db."
          "This option required to prevent accidental wipe of mongo db.")
          ("mongodb-block-start", bpo::value<uint32_t>()->default_value(0),
-         "If specified then no data pushed to mongodb until accepted block is reached.")
+         "If specified then only abi data pushed to mongodb until specified block is reached.")
          ("mongodb-uri,m", bpo::value<std::string>(),
          "MongoDB URI connection string, see: https://docs.mongodb.com/master/reference/connection-string/."
                " If not specified then plugin is disabled. Default database 'EOS' is used if not specified in URI."
